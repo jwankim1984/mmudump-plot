@@ -5,6 +5,7 @@ DMRS SNR Calculator for 5G NR and LTE
 
 import os
 import io
+import tempfile
 import numpy as np
 import matplotlib.pyplot as plt
 import streamlit as st
@@ -234,21 +235,33 @@ with st.sidebar:
 
 # Main content
 if uploaded_file is not None:
-    # Save uploaded file temporarily
-    temp_file = os.path.join(os.getcwd(), "temp_upload")
-    with open(temp_file, "wb") as f:
-        f.write(uploaded_file.getbuffer())
-    
-    # Load data
+    # Load data directly from uploaded file (no temp file needed for txt)
     try:
         file_ext = os.path.splitext(uploaded_file.name)[1].lower()
         
         if file_ext == '.txt':
-            raw_data, calculated_num_rb = load_txt_file(temp_file)
+            # For txt files, read directly from BytesIO
+            content = uploaded_file.read().decode('utf-8')
+            data_lines = np.array([list(map(float, line.strip().split())) for line in content.strip().split('\n') if line.strip()])
+            i_vals = data_lines[:, 0]
+            q_vals = data_lines[:, 1]
+            raw_data = i_vals + 1j * q_vals
+            
+            NumSym = 14
+            TonePerRB = 12
+            total_samples = len(raw_data)
+            samples_per_slot = total_samples // NumSym
+            calculated_num_rb = samples_per_slot // TonePerRB
             num_rb = calculated_num_rb
+            
             st.info(f"Detected TXT format. Auto-detected NumRB: {calculated_num_rb}")
         else:
-            raw_data = load_mbin_file(temp_file)
+            # For mbin files, use tempfile
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.mbin') as tmp:
+                tmp.write(uploaded_file.getbuffer())
+                temp_path = tmp.name
+            raw_data = load_mbin_file(temp_path)
+            os.unlink(temp_path)
             st.info(f"Detected MBIN format.")
         
         NumSym = 14
@@ -519,9 +532,8 @@ if uploaded_file is not None:
             mime="text/plain"
         )
     
-    # Cleanup
-    if os.path.exists(temp_file):
-        os.remove(temp_file)
+    # No cleanup needed for txt files (read directly)
+    # mbin temp file already cleaned up after reading
 
 else:
     st.info("👆 Please upload an IQ data file (.mbin or .txt) to begin analysis.")
