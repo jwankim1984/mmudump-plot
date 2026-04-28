@@ -99,23 +99,81 @@ def calculate_dmrs_snr_3gpp(rx_dmrs_symbol, ideal_dmrs, dmrs_indices):
 # ==================== LTE DMRS Functions (3GPP TS 36.211) ====================
 
 def generate_lte_dmrs(n_rb, start_rb, slot, symbol_idx, n_id, v_shift=0):
-    """Generate LTE DMRS sequence (3GPP TS 36.211 Section 6.10.1)"""
-    ns = slot * 2
-    M_sc = n_rb * 12
+    """Generate LTE PUSCH DMRS sequence (3GPP TS 36.211 Section 5.5.1, 5.5.2)
     
-    c_init = ((ns + 1) * (2 * n_id + 1)) * 2**16 + n_id
+    For PUSCH DMRS:
+    - Base sequence r_u,v(n) is generated based on group number u and sequence number v
+    - Cyclic shift alpha is applied
+    - For M_sc >= 36 (3 RBs), Zadoff-Chu based sequence
+    - For M_sc < 36, special sequence
     
-    c = gold_sequence(c_init, 2 * M_sc).astype(np.int32)
+    LTE slot structure:
+    - Symbol 0-6: first slot (ns = slot * 2)
+    - Symbol 7-13: second slot (ns = slot * 2 + 1)
+    """
+    M_sc = n_rb * 12  # Number of subcarriers
     
-    dmrs_seq = np.zeros(M_sc, dtype=complex)
-    for i in range(M_sc):
-        i_val = (1 - 2 * c[2*i]) / np.sqrt(2)
-        q_val = (1 - 2 * c[2*i + 1]) / np.sqrt(2)
-        dmrs_seq[i] = i_val + 1j * q_val
+    # Calculate ns (slot number within radio frame)
+    # LTE: Each subframe has 2 slots (0.5ms each)
+    # Symbol 0-6 -> ns = slot * 2
+    # Symbol 7-13 -> ns = slot * 2 + 1
+    if symbol_idx <= 6:
+        ns = slot * 2
+    else:
+        ns = slot * 2 + 1
     
+    # Group hopping disabled by default (simplified)
+    # When group hopping is disabled: u = f_ss
+    # f_ss = n_ID mod 30
+    u = n_id % 30
+    
+    # Sequence number v (3GPP TS 36.211 Section 5.5.1.3)
+    # v = 0 for base sequence
+    v = 0
+    
+    # Generate base sequence r_u,v(n) (3GPP TS 36.211 Section 5.5.1.2)
+    if M_sc >= 36:
+        # For M_sc >= 3*N_sc^RB = 36: Use Zadoff-Chu based sequence
+        # Find largest prime less than M_sc
+        primes = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97, 101, 103, 107, 109, 113, 127, 131, 137, 139, 149, 151, 157, 163, 167, 173, 179, 181, 191, 193, 197, 199, 211, 223, 227, 229, 233, 239, 241, 251, 257, 263, 269, 271, 277, 281, 283, 293]
+        N_zc = M_sc
+        for p in reversed(primes):
+            if p < M_sc:
+                N_zc = p
+                break
+        
+        # Zadoff-Chu root index q (3GPP TS 36.211 Section 5.5.1.3)
+        # q = floor(N_zc * (u + 1) / 31)
+        q = (N_zc * (u + 1)) // 31
+        
+        # Generate Zadoff-Chu root sequence
+        n = np.arange(N_zc)
+        zc_seq = np.exp(-1j * np.pi * q * n * (n + 1) / N_zc)
+        
+        # Cyclic extension to M_sc
+        r_uv = np.zeros(M_sc, dtype=complex)
+        r_uv[:N_zc] = zc_seq
+        r_uv[N_zc:] = zc_seq[:M_sc - N_zc]  # Cyclic extension
+    else:
+        # For M_sc < 36: Use sequence from table (5.5.1.2-2)
+        # Simplified: use QPSK-like sequence
+        c_init = (n_id + 1) * (2 * ns + 1) * 2**16 + n_id
+        c_init = c_init % (2**31)
+        c = gold_sequence(c_init, 2 * M_sc).astype(np.int32)
+        
+        r_uv = np.zeros(M_sc, dtype=complex)
+        for i in range(M_sc):
+            i_val = (1 - 2 * c[2*i]) / np.sqrt(2)
+            q_val = (1 - 2 * c[2*i + 1]) / np.sqrt(2)
+            r_uv[i] = i_val + 1j * q_val
+    
+    # Apply cyclic shift alpha (3GPP TS 36.211 Section 5.5.2.1.1)
+    # For PUSCH DMRS: n_cs from higher layer, default 0
     n_cs = v_shift
     alpha = 2 * np.pi * n_cs / 12
-    dmrs_seq = dmrs_seq * np.exp(1j * alpha * np.arange(M_sc))
+    
+    # DMRS sequence: r(n) = r_uv(n) * exp(j * alpha * n)
+    dmrs_seq = r_uv * np.exp(1j * alpha * np.arange(M_sc))
     
     dmrs_indices = np.arange(start_rb * 12, (start_rb + n_rb) * 12)
     
@@ -189,6 +247,12 @@ def get_slot_for_dmrs(slot, scs):
         slots_per_frame = 20
     
     return slot % slots_per_frame
+
+def perform_dft(data, n_fft=None):
+    """Perform DFT on the allocated RB data"""
+    if n_fft is None:
+        n_fft = len(data)
+    return np.fft.fftshift(np.fft.fft(data, n_fft))
 
 # ==================== Streamlit App ====================
 
@@ -332,6 +396,9 @@ if uploaded_file is not None:
                     st.markdown(f"**Mode:** LTE")
             
             # Generate DMRS and calculate SNR
+            start_idx = start_rb * 12
+            end_idx = (start_rb + rb_size) * 12
+            
             if mode == "NR":
                 if dmrs_type == "Type 1":
                     generate_dmrs = generate_nr_dmrs_type1_3gpp
@@ -358,14 +425,16 @@ if uploaded_file is not None:
                 H_dmrs_dict = {}
                 snr_results = []
                 for dmrs_sym in dmrs_syms:
-                    rx_dmrs = dat_sym[:, dmrs_sym]
+                    # LTE PUSCH: DMRS is already in frequency domain (no DFT was applied at TX)
+                    rx_dmrs = dat_sym[start_idx:end_idx, dmrs_sym]  # Already in frequency domain
+                    
                     ideal_dmrs, dmrs_indices = generate_lte_dmrs(
                         n_rb=rb_size, start_rb=start_rb, slot=dmrs_slot,
                         symbol_idx=dmrs_sym, n_id=n_id
                     )
                     snr_lte, _, _ = calculate_lte_dmrs_snr(rx_dmrs, ideal_dmrs, dmrs_indices)
                     snr_results.append((dmrs_sym, snr_lte))
-                    H_dmrs_dict[dmrs_sym] = rx_dmrs[dmrs_indices] / ideal_dmrs
+                    H_dmrs_dict[dmrs_sym] = rx_dmrs / ideal_dmrs
                 
                 ideal_dmrs, dmrs_indices = generate_lte_dmrs(
                     n_rb=rb_size, start_rb=start_rb, slot=dmrs_slot,
@@ -437,11 +506,28 @@ if uploaded_file is not None:
         dat_sym = C[data_slot_idx, :].reshape(NumSym, NumTone).T
         
         fig, axes = plt.subplots(2, 7, figsize=(14, 8))
-        fig.suptitle(f'Slot {slot} - IQ Constellation (Full BW)')
+        
+        if mode == "NR":
+            plot_data = dat_sym
+            title_suffix = 'Raw (Full BW)'
+        else:
+            start_idx = start_rb * 12
+            end_idx = (start_rb + rb_size) * 12
+            plot_data = dat_sym[start_idx:end_idx, :]
+            title_suffix = f'DFT (RB {start_rb}~{start_rb + rb_size - 1})'
+        
+        fig.suptitle(f'Slot {slot} - IQ Constellation ({title_suffix})')
         
         for sym in range(NumSym):
             ax = axes[sym // 7, sym % 7]
-            sym_data = dat_sym[:, sym]
+            
+            if mode == "LTE":
+                if sym in dmrs_syms:
+                    sym_data = plot_data[:, sym]
+                else:
+                    sym_data = perform_dft(plot_data[:, sym])
+            else:
+                sym_data = plot_data[:, sym]
             
             if sym in dmrs_syms:
                 ax.scatter(np.real(sym_data), np.imag(sym_data), marker='.', s=1)
@@ -562,3 +648,4 @@ else:
 # Footer
 st.markdown("---")
 st.markdown("*MMU Dump Plot - DMRS SNR Calculator | 3GPP TS 38.211 / TS 36.211 Compliant*")
+st.markdown("📚 [MMU Dump Plot Guidance](https://confluence-nw.sec.samsung.net/spaces/MODEMSOC/pages/894937373/MMU+Dump+Plot+Guidance)")
